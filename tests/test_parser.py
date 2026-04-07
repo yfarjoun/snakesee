@@ -622,6 +622,108 @@ Error in rule align:
         assert str(failed[0].log_file) == "logs/align.log"
 
 
+class TestRetryBehavior:
+    """Tests for how the parser handles Snakemake's retries directive."""
+
+    def test_retry_then_success_still_shows_failed(self, snakemake_dir: Path) -> None:
+        """A job that fails then succeeds on retry still appears in the failed list.
+
+        Snakemake re-emits 'rule X:' on retry, so the job reappears as running.
+        But the error from the first attempt persists in the failed list because
+        the parser has no concept of retries clearing earlier failures.
+        """
+        # Simulate: job starts, fails, retries (new rule block), succeeds
+        log_content = """\
+[Mon Jan  4 16:34:21 2026]
+rule flaky_job:
+    jobid: 1
+    wildcards: sample=A
+[Mon Jan  4 16:34:25 2026]
+Error in rule flaky_job:
+    jobid: 1
+    log: logs/flaky.log (check log file(s) for error details)
+[Mon Jan  4 16:34:26 2026]
+rule flaky_job:
+    jobid: 1
+    wildcards: sample=A
+[Mon Jan  4 16:34:30 2026]
+Finished job 1.
+1 of 1 steps (100%) done
+"""
+        log_file = snakemake_dir / "log" / "test.snakemake.log"
+        log_file.write_text(log_content)
+
+        failed = parse_failed_jobs_from_log(log_file)
+        running = parse_running_jobs_from_log(log_file)
+
+        # The job finished, so it shouldn't be running
+        assert len(running) == 0
+
+        # BUG/limitation: the failed list still contains the error from attempt 1,
+        # even though the job eventually succeeded on retry.
+        # This documents current behavior — ideally, a successful retry should
+        # clear the job from the failed list.
+        assert len(failed) == 1
+        assert failed[0].rule == "flaky_job"
+
+    def test_retry_exhausted_shows_failed(self, snakemake_dir: Path) -> None:
+        """A job that fails all retry attempts appears as failed."""
+        log_content = """\
+[Mon Jan  4 16:34:21 2026]
+rule flaky_job:
+    jobid: 1
+[Mon Jan  4 16:34:25 2026]
+Error in rule flaky_job:
+    jobid: 1
+[Mon Jan  4 16:34:26 2026]
+rule flaky_job:
+    jobid: 1
+[Mon Jan  4 16:34:30 2026]
+Error in rule flaky_job:
+    jobid: 1
+Shutting down, error in workflow
+"""
+        log_file = snakemake_dir / "log" / "test.snakemake.log"
+        log_file.write_text(log_content)
+
+        failed = parse_failed_jobs_from_log(log_file)
+        running = parse_running_jobs_from_log(log_file)
+
+        # Job should be failed, not running
+        assert len(running) == 0
+        assert len(failed) >= 1
+        assert failed[0].rule == "flaky_job"
+
+    def test_retry_success_workflow_state(self, snakemake_dir: Path) -> None:
+        """Full workflow state after a successful retry shows completed status."""
+        log_content = """\
+[Mon Jan  4 16:34:21 2026]
+rule flaky_job:
+    jobid: 1
+[Mon Jan  4 16:34:25 2026]
+Error in rule flaky_job:
+    jobid: 1
+[Mon Jan  4 16:34:26 2026]
+rule flaky_job:
+    jobid: 1
+[Mon Jan  4 16:34:30 2026]
+Finished job 1.
+1 of 1 steps (100%) done
+"""
+        log_file = snakemake_dir / "log" / "test.snakemake.log"
+        log_file.write_text(log_content)
+
+        state = parse_workflow_state(snakemake_dir, log_file=log_file)
+
+        # Workflow completed (100% done, no locks)
+        assert state.completed_jobs == 1
+        assert state.total_jobs == 1
+
+        # BUG/limitation: failed_jobs is still 1 because the parser doesn't
+        # clear failures on successful retry
+        assert state.failed_jobs == 1
+
+
 class TestParseWorkflowState:
     """Tests for parse_workflow_state function."""
 
